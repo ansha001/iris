@@ -99,3 +99,16 @@ class BaseAllocator(ABC):
             Tensor of shape (num_ranks,) with base addresses
         """
         pass
+
+    @abstractmethod
+    def owns_tensor(self, tensor: torch.Tensor) -> bool:
+        """
+        Check if a tensor is within the allocator's managed heap.
+
+        Args:
+            tensor: PyTorch tensor to check
+
+        Returns:
+            True if tensor is within the heap, False otherwise
+        """
+        pass

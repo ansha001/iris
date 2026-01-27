@@ -84,15 +84,8 @@ class SymmetricHeap:
         Returns:
             True if tensor is on the symmetric heap, False otherwise
         """
-        # Special case for empty tensors - they might not have a valid data_ptr
-        if tensor.numel() == 0:
-            return True
-
-        # Convert CUDA pointer to integer for comparison
-        tensor_ptr = int(tensor.data_ptr())
-        heap_base = int(self.heap_bases[self.cur_rank])
-
-        return tensor_ptr >= heap_base and tensor_ptr < heap_base + self.heap_size
+        # Delegate to allocator to check if tensor is in heap
+        return self.allocator.owns_tensor(tensor)
 
     def get_heap_bases(self) -> torch.Tensor:
         """Get heap base addresses for all ranks as a tensor."""

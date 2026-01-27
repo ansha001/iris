@@ -135,3 +135,21 @@ class TorchAllocator(BaseAllocator):
     def get_heap_bases(self) -> torch.Tensor:
         """Get heap base addresses as a tensor."""
         return torch.from_numpy(self.heap_bases_array).to(device=self.device, dtype=torch.uint64)
+
+    def owns_tensor(self, tensor: torch.Tensor) -> bool:
+        """
+        Check if a tensor is within the allocator's managed heap.
+
+        Args:
+            tensor: PyTorch tensor to check
+
+        Returns:
+            True if tensor is within the heap, False otherwise
+        """
+        # Special case for empty tensors - they might not have a valid data_ptr
+        if tensor.numel() == 0:
+            return True
+
+        ptr = int(tensor.data_ptr())
+        heap_base = self.get_base_address()
+        return ptr >= heap_base and ptr < heap_base + self.heap_size
