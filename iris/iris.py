@@ -62,6 +62,9 @@ import logging
 # Import logging functionality from the separate logging module
 from .logging import logger
 
+# Import tracing functionality
+from .tracing import Tracing, TraceEvent, DeviceTracing  # noqa: F401  re-export for iris.TraceEvent
+
 
 class Iris:
     """
@@ -108,6 +111,9 @@ class Iris:
 
         # Lazy initialization for ops interface
         self._ops = None
+
+        # Initialize tracing
+        self.tracing = Tracing(self)
 
     def _log_with_rank(self, level, message):
         """Helper method to log with rank information injected into the record."""
@@ -1155,6 +1161,8 @@ class Iris:
         Get the device context tensor for DeviceContext initialization.
 
         Returns a tensor encoding: [cur_rank, world_size, heap_base_0, heap_base_1, ...]
+        If tracing is enabled, also includes: [trace_enabled, max_events, trace_counter_ptr, trace_buffer_ptrs...]
+
         This opaque format allows future extension without breaking the API.
 
         Returns:
@@ -1166,7 +1174,7 @@ class Iris:
             >>> import triton
             >>> import triton.language as tl
             >>>
-            >>> shmem = iris.iris()
+            >>> ctx = iris.iris()
             >>> context_tensor = shmem.get_device_context()
             >>>
             >>> @triton.jit
@@ -1179,6 +1187,31 @@ class Iris:
 
         # Create context tensor: [cur_rank, world_size, heap_base_0, heap_base_1, ...]
         context_data = [self.cur_rank, self.num_ranks] + heap_bases_list
+
+        # Add tracing info if enabled
+        if self.tracing.enabled:
+            # Explicit buffer ordering (must match DeviceContext.initialize extraction order)
+            trace_buffer_ptrs = [
+                self.tracing.trace_buffers["event_id"].data_ptr(),
+                self.tracing.trace_buffers["pid"].data_ptr(),
+                self.tracing.trace_buffers["pid_m"].data_ptr(),
+                self.tracing.trace_buffers["pid_n"].data_ptr(),
+                self.tracing.trace_buffers["cur_rank"].data_ptr(),
+                self.tracing.trace_buffers["target_rank"].data_ptr(),
+                self.tracing.trace_buffers["xcc_id"].data_ptr(),
+                self.tracing.trace_buffers["cu_id"].data_ptr(),
+                self.tracing.trace_buffers["timestamp"].data_ptr(),
+                self.tracing.trace_buffers["address"].data_ptr(),
+                self.tracing.trace_buffers["duration_cycles"].data_ptr(),
+            ]
+            context_data += [
+                1,  # trace_enabled = 1 (true)
+                self.tracing.max_events,
+                self.tracing.trace_counter.data_ptr(),
+            ] + trace_buffer_ptrs
+        else:
+            context_data += [0]  # trace_enabled = 0 (false)
+
         context_tensor = torch.tensor(context_data, dtype=torch.int64, device=self.device)
 
         return context_tensor
@@ -1540,8 +1573,8 @@ class Iris:
 
         Provides collective operations that can be called as methods on the Iris instance.
         Example usage:
-            >>> shmem = iris.iris()
-            >>> shmem.ccl.all_to_all(output_tensor, input_tensor)
+            >>> ctx = iris.iris()
+            >>> ctx.ccl.all_to_all(output_tensor, input_tensor)
         """
 
         def __init__(self, iris_instance):
@@ -1572,16 +1605,16 @@ class Iris:
                         If None, uses default Config values.
 
             Example:
-                >>> shmem = iris.iris()
-                >>> shmem.ccl.all_to_all(output_tensor, input_tensor)
+                >>> ctx = iris.iris()
+                >>> ctx.ccl.all_to_all(output_tensor, input_tensor)
 
                 >>> # Custom configuration
                 >>> from iris.ccl import Config
                 >>> config = Config(block_size_m=128, block_size_n=32)
-                >>> shmem.ccl.all_to_all(output_tensor, input_tensor, config=config)
+                >>> ctx.ccl.all_to_all(output_tensor, input_tensor, config=config)
 
                 >>> # Async operation (no barrier)
-                >>> shmem.ccl.all_to_all(output_tensor, input_tensor, async_op=True)
+                >>> ctx.ccl.all_to_all(output_tensor, input_tensor, async_op=True)
             """
             from iris.ccl.all_to_all import all_to_all as _all_to_all
 
@@ -1606,17 +1639,17 @@ class Iris:
                         If None, uses default Config values.
 
             Example:
-                >>> shmem = iris.iris()
+                >>> ctx = iris.iris()
                 >>> # Input: (M, N), Output: (world_size * M, N)
-                >>> shmem.ccl.all_gather(output_tensor, input_tensor)
+                >>> ctx.ccl.all_gather(output_tensor, input_tensor)
 
                 >>> # Custom configuration
                 >>> from iris.ccl import Config
                 >>> config = Config(block_size_m=128, block_size_n=32)
-                >>> shmem.ccl.all_gather(output_tensor, input_tensor, config=config)
+                >>> ctx.ccl.all_gather(output_tensor, input_tensor, config=config)
 
                 >>> # Async operation (no barrier)
-                >>> shmem.ccl.all_gather(output_tensor, input_tensor, async_op=True)
+                >>> ctx.ccl.all_gather(output_tensor, input_tensor, async_op=True)
             """
             from iris.ccl.all_gather import all_gather as _all_gather
 
@@ -1670,20 +1703,20 @@ class Iris:
                            reuse internal buffers across invocations.
 
             Example:
-                >>> shmem = iris.iris()
-                >>> shmem.ccl.all_reduce(output_tensor, input_tensor)
+                >>> ctx = iris.iris()
+                >>> ctx.ccl.all_reduce(output_tensor, input_tensor)
 
                 >>> # Custom configuration with ring variant
                 >>> from iris.ccl import Config
                 >>> config = Config(all_reduce_variant="ring")
-                >>> shmem.ccl.all_reduce(output_tensor, input_tensor, config=config)
+                >>> ctx.ccl.all_reduce(output_tensor, input_tensor, config=config)
 
                 >>> # Two-shot variant with block distribution
                 >>> config = Config(all_reduce_variant="two_shot", all_reduce_distribution=1)
-                >>> shmem.ccl.all_reduce(output_tensor, input_tensor, config=config)
+                >>> ctx.ccl.all_reduce(output_tensor, input_tensor, config=config)
 
                 >>> # Async operation (no barrier)
-                >>> shmem.ccl.all_reduce(output_tensor, input_tensor, async_op=True)
+                >>> ctx.ccl.all_reduce(output_tensor, input_tensor, async_op=True)
             """
             from iris.ccl.all_reduce import all_reduce as _all_reduce
             from iris.ccl import ReduceOp
@@ -1725,13 +1758,13 @@ class Iris:
                         Only supports reduce_scatter_variant="two_shot".
 
             Example:
-                >>> shmem = iris.iris()
-                >>> shmem.ccl.reduce_scatter(output_tensor, input_tensor)
+                >>> ctx = iris.iris()
+                >>> ctx.ccl.reduce_scatter(output_tensor, input_tensor)
 
                 >>> # Custom configuration
                 >>> from iris.ccl import Config
                 >>> config = Config(reduce_scatter_variant="two_shot", all_reduce_distribution=1)
-                >>> shmem.ccl.reduce_scatter(output_tensor, input_tensor, config=config)
+                >>> ctx.ccl.reduce_scatter(output_tensor, input_tensor, config=config)
             """
             from iris.ccl.reduce_scatter import reduce_scatter as _reduce_scatter
             from iris.ccl import ReduceOp
@@ -1804,14 +1837,27 @@ class DeviceContext:
         rank: Current rank (constexpr)
         world_size: Total number of ranks (constexpr)
         heap_bases: Heap base pointers for all ranks (tensor)
+        trace_enabled: Whether tracing is enabled (constexpr)
+        max_trace_events: Maximum number of trace events (constexpr)
+        trace_counter: Pointer to atomic event counter (tensor)
+        trace_buf_pid: Pointer to pid buffer (tensor)
+        trace_buf_pid_m: Pointer to pid_m buffer (tensor)
+        trace_buf_pid_n: Pointer to pid_n buffer (tensor)
+        trace_buf_cur_rank: Pointer to cur_rank buffer (tensor)
+        trace_buf_target_rank: Pointer to target_rank buffer (tensor)
+        trace_buf_xcc_id: Pointer to xcc_id buffer (tensor)
+        trace_buf_cu_id: Pointer to cu_id buffer (tensor)
+        trace_buf_timestamp: Pointer to timestamp buffer (tensor)
+        trace_buf_address: Pointer to address buffer (tensor)
     """
 
     rank: tl.constexpr
     world_size: tl.constexpr
     heap_bases: tl.tensor
+    tracing: DeviceTracing
 
     @triton.constexpr_function
-    def __init__(self, rank, world_size, heap_bases):
+    def __init__(self, rank, world_size, heap_bases, tracing):
         """
         Internal constructor - use DeviceContext.initialize() instead.
 
@@ -1819,24 +1865,28 @@ class DeviceContext:
             rank: Current rank (constexpr)
             world_size: Total number of ranks (constexpr)
             heap_bases: Heap base pointers for all ranks (tensor)
+            tracing: DeviceTracing instance
         """
         self.rank = tl.constexpr(rank)
         self.world_size = tl.constexpr(world_size)
         self.heap_bases = heap_bases
+        self.tracing = tracing
 
     @staticmethod
     @triton.jit
-    def initialize(context_tensor, rank, world_size):
+    def initialize(context_tensor, rank, world_size, tracing: tl.constexpr = False):
         """
         Initialize DeviceContext from the encoded context tensor.
 
-        The context tensor has the format: [cur_rank, num_ranks, heap_base_0, heap_base_1, ...]
-        This method extracts heap_bases and creates the DeviceContext.
+        The context tensor has the format:
+        - [cur_rank, num_ranks, heap_base_0, ..., heap_base_N, trace_info...]
+        - If tracing=True: extracts trace buffer pointers from context_tensor
 
         Args:
             context_tensor: Pointer to encoded context data (from Iris.get_device_context())
             rank: Current rank (must be constexpr in kernel signature)
             world_size: Total number of ranks (must be constexpr in kernel signature)
+            tracing: Enable event tracing (constexpr, default: False)
 
         Returns:
             DeviceContext: Initialized device context
@@ -1845,18 +1895,89 @@ class DeviceContext:
             >>> import iris
             >>> from iris import DeviceContext
             >>>
-            >>> shmem = iris.iris()
-            >>> context_tensor = shmem.get_device_context()
+            >>> ctx = iris.iris()
+            >>> ctx.tracing.enable(max_events=1_000_000)
+            >>> context_tensor = ctx.get_device_context()
             >>>
             >>> @triton.jit
             >>> def kernel(context_tensor, rank: tl.constexpr, world_size: tl.constexpr, ...):
+            >>>     # Without tracing
             >>>     ctx = DeviceContext.initialize(context_tensor, rank, world_size)
-            >>>     data = ctx.load(buffer, from_rank=1)
+            >>>
+            >>>     # With tracing
+            >>>     ctx = DeviceContext.initialize(context_tensor, rank, world_size, tracing=True)
+            >>>     ctx.tracing.record_event_start(event_id=TraceEvent().put, target_rank=1, address=ptr)
         """
-        # Extract heap bases (from index 2 onwards) - this happens once at initialization
+        # Extract heap bases (from index 2 onwards)
         heap_bases = context_tensor + 2  # Offset pointer to start at heap bases
 
-        return DeviceContext(rank, world_size, heap_bases)
+        if tracing:
+            # Extract tracing info (starts after heap_bases)
+            trace_info_idx = 2 + world_size + 1  # Skip: cur_rank, num_ranks, heap_bases, trace_enabled flag
+            max_events = tl.load(context_tensor + trace_info_idx + 0)
+            trace_counter_ptr = tl.load(context_tensor + trace_info_idx + 1)
+
+            # Cast trace_counter_ptr to pointer type
+            trace_counter = tl.cast(trace_counter_ptr, tl.pointer_type(tl.int32))
+
+            # Extract trace buffer pointers (11 buffers)
+            base_idx = trace_info_idx + 2
+            trace_buf_event_id = tl.cast(tl.load(context_tensor + base_idx + 0), tl.pointer_type(tl.int32))
+            trace_buf_pid = tl.cast(tl.load(context_tensor + base_idx + 1), tl.pointer_type(tl.int32))
+            trace_buf_pid_m = tl.cast(tl.load(context_tensor + base_idx + 2), tl.pointer_type(tl.int32))
+            trace_buf_pid_n = tl.cast(tl.load(context_tensor + base_idx + 3), tl.pointer_type(tl.int32))
+            trace_buf_cur_rank = tl.cast(tl.load(context_tensor + base_idx + 4), tl.pointer_type(tl.int32))
+            trace_buf_target_rank = tl.cast(tl.load(context_tensor + base_idx + 5), tl.pointer_type(tl.int32))
+            trace_buf_xcc_id = tl.cast(tl.load(context_tensor + base_idx + 6), tl.pointer_type(tl.int32))
+            trace_buf_cu_id = tl.cast(tl.load(context_tensor + base_idx + 7), tl.pointer_type(tl.int32))
+            trace_buf_timestamp = tl.cast(tl.load(context_tensor + base_idx + 8), tl.pointer_type(tl.int64))
+            trace_buf_address = tl.cast(tl.load(context_tensor + base_idx + 9), tl.pointer_type(tl.int64))
+            trace_buf_duration_cycles = tl.cast(tl.load(context_tensor + base_idx + 10), tl.pointer_type(tl.int64))
+
+            # Create DeviceTracing instance
+            device_tracing = DeviceTracing(
+                enabled=tracing,
+                rank=rank,
+                max_events=max_events,
+                counter=trace_counter,
+                buf_event_id=trace_buf_event_id,
+                buf_pid=trace_buf_pid,
+                buf_pid_m=trace_buf_pid_m,
+                buf_pid_n=trace_buf_pid_n,
+                buf_cur_rank=trace_buf_cur_rank,
+                buf_target_rank=trace_buf_target_rank,
+                buf_xcc_id=trace_buf_xcc_id,
+                buf_cu_id=trace_buf_cu_id,
+                buf_timestamp=trace_buf_timestamp,
+                buf_address=trace_buf_address,
+                buf_duration_cycles=trace_buf_duration_cycles,
+            )
+
+            return DeviceContext(rank, world_size, heap_bases, device_tracing)
+        else:
+            # When tracing disabled, use dummy pointers (never dereferenced; we return early in record_*)
+            dummy_ptr_i32 = tl.cast(context_tensor, tl.pointer_type(tl.int32))
+            dummy_ptr_i64 = tl.cast(context_tensor, tl.pointer_type(tl.int64))
+            max_events_zero = tl.full((), 0, dtype=tl.int32)
+            device_tracing = DeviceTracing(
+                enabled=False,
+                rank=rank,
+                max_events=max_events_zero,
+                counter=dummy_ptr_i32,
+                buf_event_id=dummy_ptr_i32,
+                buf_pid=dummy_ptr_i32,
+                buf_pid_m=dummy_ptr_i32,
+                buf_pid_n=dummy_ptr_i32,
+                buf_cur_rank=dummy_ptr_i32,
+                buf_target_rank=dummy_ptr_i32,
+                buf_xcc_id=dummy_ptr_i32,
+                buf_cu_id=dummy_ptr_i32,
+                buf_timestamp=dummy_ptr_i64,
+                buf_address=dummy_ptr_i64,
+                buf_duration_cycles=dummy_ptr_i64,
+            )
+
+            return DeviceContext(rank, world_size, heap_bases, device_tracing)
 
     @triton.jit
     def _translate(self, ptr, from_rank, to_rank):
