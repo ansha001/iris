@@ -66,6 +66,7 @@ from .tracing import Tracing, TraceEvent, DeviceTracing  # noqa: F401  re-export
 
 # Import shared tensor-creation helpers
 from . import tensor_creation
+from .util import is_simulation_env
 
 
 class Iris:
@@ -89,6 +90,9 @@ class Iris:
     """
 
     def __init__(self, heap_size=1 << 30, allocator_type="torch"):
+        if is_simulation_env():
+            allocator_type = "torch"
+
         # Initialize distributed environment
         comm, cur_rank, num_ranks = init_distributed()
         num_gpus = count_devices()
@@ -107,8 +111,21 @@ class Iris:
         self.device = f"cuda:{gpu_id}"
         self.heap_bases = self.heap.get_heap_bases()
 
-        for i in range(num_ranks):
-            self.debug(f"GPU {i}: Heap base {hex(int(self.heap_bases[i].item()))}")
+        if is_simulation_env():
+            import json
+
+            heap_bases_list = [int(self.heap_bases[r].item()) for r in range(self.num_ranks)]
+            out_path = f"iris_rank_{self.cur_rank}_heap_bases.json"
+            with open(out_path, "w") as f:
+                json.dump(
+                    {
+                        "rank": self.cur_rank,
+                        "num_ranks": self.num_ranks,
+                        "heap_bases": [hex(b) for b in heap_bases_list],
+                    },
+                    f,
+                    indent=2,
+                )
 
         distributed_barrier()
 
@@ -996,6 +1013,24 @@ class Iris:
             >>> print(f"GPU has {cu_count} CUs")  # GPU has 304 CUs
         """
         return get_cu_count(self.gpu_id)
+
+    def get_device_id(self):
+        """
+        Get the device ID used by this Iris instance.
+
+        In simulation mode, this may differ from the local rank if multiple
+        ranks share a single GPU. This is the device ID that was set during
+        Iris initialization.
+
+        Returns:
+            int: The GPU device ID used by this Iris instance.
+
+        Example:
+            >>> ctx = iris.iris(1 << 20)
+            >>> device_id = ctx.get_device_id()
+            >>> print(f"Using GPU {device_id}")  # Using GPU 0
+        """
+        return self.gpu_id
 
     def get_rank(self):
         """
